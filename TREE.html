@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>手势圣诞树</title>
+  <style>
+    :root{
+      --bg1:#061022;
+      --bg2:#0b1b3a;
+      --text:rgba(255,255,255,.92);
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0;
+      min-height:100vh;
+      display:grid;
+      place-items:center;
+      background:
+        radial-gradient(1200px 800px at 20% 10%, rgba(124,58,237,.25), transparent 55%),
+        radial-gradient(900px 700px at 75% 35%, rgba(34,197,94,.18), transparent 55%),
+        linear-gradient(180deg,var(--bg1),var(--bg2));
+      color:var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, "PingFang SC", "Microsoft YaHei";
+      overflow:hidden;
+    }
+    .wrap{
+      width:min(820px, 96vw);
+      padding:18px;
+      border-radius:18px;
+      border:1px solid rgba(255,255,255,.12);
+      background:rgba(255,255,255,.06);
+      box-shadow:0 20px 70px rgba(0,0,0,.45);
+    }
+    h1{margin:0 0 8px 0;font-size:18px}
+    .sub{font-size:12px;color:rgba(255,255,255,.7);line-height:1.5;margin-bottom:10px}
+    canvas{
+      width:100%;
+      height:auto;
+      aspect-ratio: 16/10;
+      border-radius:16px;
+      background:rgba(0,0,0,.22);
+      border:1px solid rgba(255,255,255,.12);
+      touch-action:none; /* 允许我们接管手势 */
+    }
+    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;justify-content:space-between;margin-top:10px}
+    button{
+      border:1px solid rgba(255,255,255,.14);
+      background:rgba(255,255,255,.10);
+      color:rgba(255,255,255,.92);
+      border-radius:14px;
+      padding:10px 12px;
+      cursor:pointer;
+      font-weight:650;
+    }
+    button:hover{transform:translateY(-1px)}
+    .pill{
+      padding:6px 10px;border-radius:999px;
+      background:rgba(255,255,255,.08);
+      border:1px solid rgba(255,255,255,.12);
+      font-size:12px;color:rgba(255,255,255,.72);
+      display:inline-flex;gap:8px;align-items:center
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>🎄 手势圣诞树</h1>
+    <div class="sub">
+      手机：可用<strong>手指拖拽</strong>让树摆动；若支持也可用<strong>倾斜手机</strong>控制（iPhone 需要点“开启倾斜控制”授权）。<br/>
+      电脑：用<strong>鼠标拖拽</strong>即可。
+    </div>
+
+    <canvas id="c" width="960" height="600"></canvas>
+
+    <div class="row">
+      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+        <button id="enableTilt">开启倾斜控制（手机）</button>
+        <button id="reset">回正</button>
+      </div>
+      <div class="pill">摆动：<b id="val">0.00</b></div>
+    </div>
+  </div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+
+  const valEl = document.getElementById('val');
+  const enableTiltBtn = document.getElementById('enableTilt');
+  const resetBtn = document.getElementById('reset');
+
+  // 控制量：targetTilt（目标摆动），tilt（当前摆动）
+  // 范围大概 [-1, 1]，会映射到角度
+  let targetTilt = 0;
+  let tilt = 0;
+
+  // 物理感：弹簧+阻尼
+  let vel = 0;
+  const stiffness = 0.12; // 弹性
+  const damping = 0.82;   // 阻尼
+
+  // 粒子雪花
+  const snow = Array.from({length: 140}, () => ({
+    x: Math.random(),
+    y: Math.random(),
+    r: 0.6 + Math.random()*1.8,
+    s: 0.2 + Math.random()*0.8
+  }));
+
+  function resize() {
+    // 让画布在高分屏更清晰
+    const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = Math.round(rect.width * dpr);
+    canvas.height = Math.round(rect.height * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  function clamp(v, a, b){ return Math.max(a, Math.min(b, v)); }
+
+  // 画一个带“摆动”的圣诞树
+  function drawTree(w, h) {
+    ctx.clearRect(0,0,w,h);
+
+    // 背景雪
+    ctx.save();
+    ctx.fillStyle = "rgba(255,255,255,.06)";
+    for (const p of snow) {
+      const x = p.x * w;
+      const y = p.y * h;
+      ctx.beginPath();
+      ctx.arc(x, y, p.r, 0, Math.PI*2);
+      ctx.fill();
+      p.y += p.s / 220;
+      if (p.y > 1.05) { p.y = -0.05; p.x = Math.random(); }
+    }
+    ctx.restore();
+
+    // 地面
+    ctx.fillStyle = "rgba(255,255,255,.08)";
+    ctx.beginPath();
+    ctx.ellipse(w*0.52, h*0.86, w*0.42, h*0.12, 0, 0, Math.PI*2);
+    ctx.fill();
+
+    // 摆动参数：角度（弧度）
+    const angle = tilt * 0.35; // 最大大概 0.35rad ≈ 20度
+
+    // 树的基准位置
+    const baseX = w * 0.52;
+    const baseY = h * 0.82;
+
+    // 树干
+    ctx.save();
+    ctx.translate(baseX, baseY);
+    ctx.rotate(angle);
+
+    // 树干（先画在原点上方）
+    ctx.fillStyle = "rgba(161,98,7,.85)";
+    const trunkW = w*0.04, trunkH = h*0.16;
+    ctx.beginPath();
+    ctx.roundRect(-trunkW/2, -trunkH, trunkW, trunkH, 8);
+    ctx.fill();
+
+    // 树叶（分层三角）
+    const layers = 4;
+    for (let i=0;i<layers;i++){
+      const t = i/(layers-1);
+      const y = -trunkH - (h*0.08) - t*(h*0.36);
+      const halfW = (w*0.23) * (1.05 - t*0.72);
+      const height = (h*0.16) * (1.0 - t*0.08);
+
+      // 叶子颜色带一点层次
+      ctx.fillStyle = `rgba(34,197,94,${0.78 - t*0.08})`;
+      ctx.beginPath();
+      ctx.moveTo(0, y - height);
+      ctx.lineTo(-halfW, y + height);
+      ctx.lineTo( halfW, y + height);
+      ctx.closePath();
+      ctx.fill();
+
+      // 装饰灯（跟随树一起转）
+      const bulbs = 6 + i*2;
+      for (let k=0;k<bulbs;k++){
+        const u = (k/(bulbs-1)) * 2 - 1; // [-1,1]
+        const bx = u * halfW * 0.78;
+        const by = y + height*0.25 + Math.sin(k*1.7 + i)*height*0.12;
+
+        // 灯泡颜色循环
+        const colors = [
+          "rgba(250,204,21,.95)", // 黄
+          "rgba(239,68,68,.95)",  // 红
+          "rgba(59,130,246,.95)", // 蓝
+          "rgba(168,85,247,.95)"  // 紫
+        ];
+        ctx.fillStyle = colors[(k+i)%colors.length];
+        ctx.beginPath();
+        ctx.arc(bx, by, 5.2, 0, Math.PI*2);
+        ctx.fill();
+
+        // 微光
+        ctx.fillStyle = "rgba(255,255,255,.10)";
+        ctx.beginPath();
+        ctx.arc(bx-2, by-2, 7.8, 0, Math.PI*2);
+        ctx.fill();
+      }
+    }
+
+    // 星星（在树顶）
+    const topY = -trunkH - h*0.50;
+    ctx.save();
+    ctx.translate(0, topY);
+    ctx.rotate(-angle*0.25);
+    drawStar(0, 0, 5, 18, 8);
+    ctx.restore();
+
+    ctx.restore(); // 结束树整体变换
+  }
+
+  function drawStar(x, y, spikes, outerR, innerR){
+    ctx.save();
+    ctx.translate(x,y);
+    ctx.fillStyle = "rgba(250,204,21,.95)";
+    ctx.beginPath();
+    let rot = Math.PI/2 * 3;
+    let step = Math.PI / spikes;
+    ctx.moveTo(0, -outerR);
+    for(let i=0;i<spikes;i++){
+      ctx.lineTo(Math.cos(rot)*outerR, Math.sin(rot)*outerR);
+      rot += step;
+      ctx.lineTo(Math.cos(rot)*innerR, Math.sin(rot)*innerR);
+      rot += step;
+    }
+    ctx.closePath();
+    ctx.fill();
+
+    // 光晕
+    ctx.fillStyle = "rgba(250,204,21,.16)";
+    ctx.beginPath();
+    ctx.arc(0,0, outerR*1.8, 0, Math.PI*2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // 动画循环：弹簧追随 targetTilt
+  function frame(){
+    const force = (targetTilt - tilt) * stiffness;
+    vel = (vel + force) * damping;
+    tilt = tilt + vel;
+
+    // 防止太离谱
+    tilt = clamp(tilt, -1.2, 1.2);
+
+    const rect = canvas.getBoundingClientRect();
+    const w = rect.width;
+    const h = rect.height;
+    drawTree(w, h);
+    valEl.textContent = tilt.toFixed(2);
+
+    requestAnimationFrame(frame);
+  }
+
+  // 手势：拖拽控制 targetTilt
+  let dragging = false;
+  let lastX = 0;
+
+  function pointerDown(e){
+    dragging = true;
+    lastX = e.clientX ?? (e.touches && e.touches[0]?.clientX) ?? 0;
+  }
+  function pointerMove(e){
+    if (!dragging) return;
+    const x = e.clientX ?? (e.touches && e.touches[0]?.clientX) ?? lastX;
+    const dx = x - lastX;
+    lastX = x;
+    // dx 映射到目标摆动
+    targetTilt = clamp(targetTilt + dx / 220, -1, 1);
+  }
+  function pointerUp(){ dragging = false; }
+
+  canvas.addEventListener('pointerdown', pointerDown);
+  canvas.addEventListener('pointermove', pointerMove);
+  window.addEventListener('pointerup', pointerUp);
+
+  // 兼容部分移动端未完整 pointer 事件的情况
+  canvas.addEventListener('touchstart', (e)=>pointerDown(e), {passive:true});
+  canvas.addEventListener('touchmove', (e)=>{pointerMove(e); e.preventDefault();}, {passive:false});
+  window.addEventListener('touchend', pointerUp);
+
+  // 倾斜控制（手机）
+  let tiltEnabled = false;
+  function onOrientation(e){
+    if (!tiltEnabled) return;
+    // gamma: 左右倾斜（-90~90）
+    const g = typeof e.gamma === 'number' ? e.gamma : 0;
+    targetTilt = clamp(g / 25, -1, 1);
+  }
+
+  async function enableTilt(){
+    // iOS 需要用户手势触发权限请求
+    try{
+      if (typeof DeviceOrientationEvent !== 'undefined' &&
+          typeof DeviceOrientationEvent.requestPermission === 'function') {
+        const res = await DeviceOrientationEvent.requestPermission();
+        if (res !== 'granted') {
+          alert('未授权：无法使用倾斜控制。你仍可用手指拖拽控制。');
+          return;
+        }
+      }
+      tiltEnabled = true;
+      window.addEventListener('deviceorientation', onOrientation);
+      alert('倾斜控制已开启！左右倾斜手机试试～');
+    }catch(err){
+      console.log(err);
+      alert('开启失败：可能浏览器不支持。仍可用手指拖拽控制。');
+    }
+  }
+
+  enableTiltBtn.addEventListener('click', enableTilt);
+  resetBtn.addEventListener('click', ()=>{
+    targetTilt = 0;
+    tilt = 0;
+    vel = 0;
+  });
+
+  window.addEventListener('resize', resize);
+
+  // 兼容 roundRect
+  if (!CanvasRenderingContext2D.prototype.roundRect) {
+    CanvasRenderingContext2D.prototype.roundRect = function(x, y, w, h, r){
+      r = Math.min(r, w/2, h/2);
+      this.beginPath();
+      this.moveTo(x+r, y);
+      this.arcTo(x+w, y, x+w, y+h, r);
+      this.arcTo(x+w, y+h, x, y+h, r);
+      this.arcTo(x, y+h, x, y, r);
+      this.arcTo(x, y, x+w, y, r);
+      this.closePath();
+      return this;
+    }
+  }
+
+  // 初始化
+  resize();
+  frame();
+})();
+</script>
+</body>
+</html>
