@@ -1,0 +1,473 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>🎄 星星圣诞树 · 手势互动</title>
+  <style>
+    :root{--bg:#060a18;--fg:rgba(255,255,255,.92);--muted:rgba(255,255,255,.65)}
+    *{box-sizing:border-box}
+    body{
+      margin:0;min-height:100vh;display:grid;place-items:center;
+      background:
+        radial-gradient(1100px 700px at 20% 10%, rgba(124,58,237,.22), transparent 55%),
+        radial-gradient(900px 600px at 75% 35%, rgba(34,197,94,.14), transparent 55%),
+        linear-gradient(180deg, #050714, var(--bg));
+      color:var(--fg);
+      font-family: system-ui,-apple-system,"PingFang SC","Microsoft YaHei",Arial;
+      overflow:hidden;
+    }
+    .wrap{
+      width:min(980px, 96vw);
+      padding:16px;
+      border:1px solid rgba(255,255,255,.12);
+      background:rgba(255,255,255,.06);
+      border-radius:18px;
+      box-shadow:0 18px 60px rgba(0,0,0,.45);
+    }
+    h1{margin:0 0 6px 0;font-size:18px}
+    .sub{font-size:12px;color:var(--muted);line-height:1.6;margin-bottom:10px}
+    .grid{display:grid;grid-template-columns: 1fr;gap:10px}
+    canvas{
+      width:100%;
+      height:auto;
+      aspect-ratio: 16/10;
+      border-radius:16px;
+      background:rgba(0,0,0,.22);
+      border:1px solid rgba(255,255,255,.12);
+    }
+    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;justify-content:space-between}
+    button{
+      border:1px solid rgba(255,255,255,.14);
+      background:rgba(255,255,255,.10);
+      color:var(--fg);
+      border-radius:14px;
+      padding:10px 12px;
+      cursor:pointer;
+      font-weight:650;
+    }
+    button:hover{transform:translateY(-1px)}
+    .pill{
+      display:inline-flex;gap:8px;align-items:center;
+      padding:6px 10px;border-radius:999px;
+      background:rgba(255,255,255,.08);
+      border:1px solid rgba(255,255,255,.12);
+      font-size:12px;color:var(--muted);
+    }
+    video{display:none}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>🎄 星星填充圣诞树 · 摄像头手势互动</h1>
+    <div class="sub">
+      允许摄像头后：<b>食指指尖</b>移动 → 星星跟随；<b>拇指+食指捏合</b> → 星星聚拢/散开。<br/>
+      （需要 HTTPS 才更稳定：GitHub Pages 最合适）
+    </div>
+
+    <div class="grid">
+      <canvas id="view" width="960" height="600"></canvas>
+      <div class="row">
+        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+          <button id="start">开启摄像头</button>
+          <button id="toggleCam">显示/隐藏摄像头背景</button>
+          <button id="reset">回正</button>
+        </div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+          <span class="pill">Pinch：<b id="pinch">—</b></span>
+          <span class="pill">手：<b id="hand">未检测</b></span>
+          <span class="pill">星星数：<b id="n">0</b></span>
+        </div>
+      </div>
+    </div>
+
+    <video id="video" playsinline></video>
+  </div>
+
+  <!-- MediaPipe Hands (CDN) -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+
+<script>
+(() => {
+  const canvas = document.getElementById('view');
+  const ctx = canvas.getContext('2d');
+  const video = document.getElementById('video');
+
+  const startBtn = document.getElementById('start');
+  const toggleCamBtn = document.getElementById('toggleCam');
+  const resetBtn = document.getElementById('reset');
+
+  const pinchEl = document.getElementById('pinch');
+  const handEl = document.getElementById('hand');
+  const nEl = document.getElementById('n');
+
+  let showCamera = false;
+  toggleCamBtn.onclick = () => showCamera = !showCamera;
+
+  // ===== Tree mask parameters =====
+  // Tree in normalized canvas space [0..1]
+  const TREE = {
+    cx: 0.52,
+    top: 0.12,
+    bottom: 0.86,
+    halfWidthAtBottom: 0.26,   // tree base half width
+    trunkW: 0.06,
+    trunkH: 0.12
+  };
+
+  // ===== Stars =====
+  const STAR_COUNT = 1100; // 多一点更“填充”
+  const stars = [];
+  let basePoints = []; // 初始树内点云
+
+  function rand(min, max){ return min + Math.random()*(max-min); }
+  function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
+
+  // 判断点是否在“树形区域”内（简化为：三角形树 + 矩形树干）
+  function insideTree(u, v){
+    // tree triangle
+    const {cx, top, bottom, halfWidthAtBottom} = TREE;
+    if (v < top || v > bottom) return false;
+
+    const t = (v - top) / (bottom - top);           // 0(top) -> 1(bottom)
+    const halfW = halfWidthAtBottom * t;            // 线性展开
+    const left = cx - halfW;
+    const right = cx + halfW;
+
+    const inTri = (u >= left && u <= right);
+
+    // trunk
+    const trunkTop = bottom;
+    const trunkBottom = bottom + TREE.trunkH;
+    const trunkLeft = cx - TREE.trunkW/2;
+    const trunkRight = cx + TREE.trunkW/2;
+    const inTrunk = (v >= trunkTop && v <= trunkBottom && u >= trunkLeft && u <= trunkRight);
+
+    return inTri || inTrunk;
+  }
+
+  // 在树形区域内采样点
+  function sampleTreePoints(count){
+    const pts = [];
+    let guard = 0;
+    while (pts.length < count && guard < count*80){
+      guard++;
+      const u = Math.random();
+      const v = Math.random();
+      if (insideTree(u,v)){
+        pts.push({u, v});
+      }
+    }
+    return pts;
+  }
+
+  // 画星星（简单五角星）
+  function drawStar(x, y, r, rot){
+    ctx.save();
+    ctx.translate(x,y);
+    ctx.rotate(rot);
+    ctx.beginPath();
+    const spikes = 5;
+    const outer = r;
+    const inner = r * 0.45;
+    let ang = -Math.PI/2;
+    const step = Math.PI / spikes;
+    ctx.moveTo(Math.cos(ang)*outer, Math.sin(ang)*outer);
+    for(let i=0;i<spikes;i++){
+      ctx.lineTo(Math.cos(ang)*outer, Math.sin(ang)*outer);
+      ang += step;
+      ctx.lineTo(Math.cos(ang)*inner, Math.sin(ang)*inner);
+      ang += step;
+    }
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // 初始化星星：把点云映射到 stars
+  function initStars(){
+    basePoints = sampleTreePoints(STAR_COUNT);
+    stars.length = 0;
+    for (let i=0;i<STAR_COUNT;i++){
+      const p = basePoints[i];
+      stars.push({
+        // base position in normalized space
+        u: p.u, v: p.v,
+        // dynamics
+        x: p.u, y: p.v,
+        vx: 0, vy: 0,
+        // style
+        r: rand(1.2, 2.8),
+        rot: rand(0, Math.PI*2),
+        tw: rand(0.2, 1.0),
+        hue: rand(40, 60) // 金黄
+      });
+    }
+    nEl.textContent = String(STAR_COUNT);
+  }
+
+  // ===== Hand control state =====
+  // handPos: [0..1] 画布空间，pinch: [0..1]
+  let handX = 0.52, handY = 0.45;
+  let haveHand = false;
+
+  // pinchRaw: thumb-index distance in normalized image; convert to pinchStrength
+  let pinchStrength = 0.0; // 0(张开/散) -> 1(捏合/聚)
+
+  function resetControl(){
+    handX = 0.52; handY = 0.45;
+    pinchStrength = 0.0;
+  }
+  resetBtn.onclick = resetControl;
+
+  // ===== Physics: 星星跟手势“聚拢/散开/跟随” =====
+  // 思路：
+  // - 每个星星有一个“树内基准位置 base(u,v)”
+  // - 根据 pinchStrength：
+  //   - 越捏合：越向 handPos 聚拢（吸附强）
+  //   - 越张开：更靠近 base（回到树形填充）
+  // - 同时加一点“涟漪/抖动”，更像活的星星
+  function step(dt){
+    // 动力参数
+    const attract = 18 + pinchStrength * 55;      // 吸引强度
+    const returnK = 26 * (1 - pinchStrength);    // 回归基准
+    const damp = 0.86;
+
+    for (let i=0;i<stars.length;i++){
+      const s = stars[i];
+
+      // 目标点：在 base 和 handPos 之间插值
+      const tx = s.u*(1 - pinchStrength) + handX*pinchStrength;
+      const ty = s.v*(1 - pinchStrength) + handY*pinchStrength;
+
+      // 力：朝目标点
+      const dx = tx - s.x;
+      const dy = ty - s.y;
+
+      // 额外：张开时更“回树里”
+      const rx = (s.u - s.x) * returnK;
+      const ry = (s.v - s.y) * returnK;
+
+      s.vx = (s.vx + dx*attract + rx) * damp;
+      s.vy = (s.vy + dy*attract + ry) * damp;
+
+      // 轻微漂浮（更梦幻）
+      const jig = (0.0018 + 0.0025*(1-pinchStrength));
+      s.vx += (Math.sin((i*0.7 + performance.now()*0.003)))*jig;
+      s.vy += (Math.cos((i*0.9 + performance.now()*0.0027)))*jig;
+
+      s.x += s.vx * dt;
+      s.y += s.vy * dt;
+
+      // 限制在画布范围（避免飞出）
+      s.x = clamp(s.x, 0.02, 0.98);
+      s.y = clamp(s.y, 0.02, 0.98);
+
+      // 星星自转
+      s.rot += (0.6 + pinchStrength*1.2) * dt * 0.03;
+    }
+  }
+
+  function draw(){
+    const w = canvas.width, h = canvas.height;
+    // 背景
+    ctx.clearRect(0,0,w,h);
+
+    if (showCamera && video.readyState >= 2){
+      // 摄像头背景（轻微变暗）
+      ctx.save();
+      ctx.globalAlpha = 0.35;
+      // 镜像显示更直观
+      ctx.translate(w,0);
+      ctx.scale(-1,1);
+      ctx.drawImage(video, 0,0,w,h);
+      ctx.restore();
+    }
+
+    // 柔和背景雾
+    ctx.save();
+    const g = ctx.createRadialGradient(w*0.2, h*0.15, 10, w*0.2, h*0.15, w*0.9);
+    g.addColorStop(0, "rgba(124,58,237,0.18)");
+    g.addColorStop(1, "rgba(0,0,0,0)");
+    ctx.fillStyle = g;
+    ctx.fillRect(0,0,w,h);
+    ctx.restore();
+
+    // 先画树轮廓（淡淡的）
+    drawTreeSilhouette(w,h);
+
+    // 画星星（作为树的“填充”）
+    for (const s of stars){
+      // 仅渲染树区域附近（提升“树形感”）
+      // pinch 时允许离开树一点点
+      const inTreeNow = insideTree(s.x, s.y) || pinchStrength > 0.35;
+      if (!inTreeNow) continue;
+
+      const x = s.x * w;
+      const y = s.y * h;
+
+      // 闪烁
+      const tw = 0.65 + 0.35*Math.sin(performance.now()*0.006 + s.tw*10);
+      ctx.fillStyle = `hsla(${s.hue} 95% 65% / ${0.55 + 0.35*tw})`;
+      drawStar(x, y, s.r * (0.85 + 0.45*tw), s.rot);
+    }
+
+    // 顶部大星星
+    drawTopStar(w,h);
+
+    // 手的调试点（可关）
+    if (haveHand){
+      ctx.save();
+      ctx.globalAlpha = 0.9;
+      ctx.fillStyle = "rgba(34,197,94,0.9)";
+      ctx.beginPath();
+      ctx.arc(handX*w, handY*h, 6, 0, Math.PI*2);
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  function drawTreeSilhouette(w,h){
+    const {cx, top, bottom, halfWidthAtBottom} = TREE;
+    ctx.save();
+    ctx.fillStyle = "rgba(34,197,94,0.10)";
+    ctx.strokeStyle = "rgba(255,255,255,0.12)";
+    ctx.lineWidth = 2;
+
+    ctx.beginPath();
+    ctx.moveTo((cx)*w, top*h);
+    ctx.lineTo((cx - halfWidthAtBottom)*w, bottom*h);
+    ctx.lineTo((cx + halfWidthAtBottom)*w, bottom*h);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+
+    // trunk
+    ctx.fillStyle = "rgba(161,98,7,0.18)";
+    const trunkX = (cx - TREE.trunkW/2)*w;
+    const trunkY = bottom*h;
+    ctx.fillRect(trunkX, trunkY, TREE.trunkW*w, TREE.trunkH*h);
+
+    // 地面
+    ctx.fillStyle = "rgba(255,255,255,0.06)";
+    ctx.beginPath();
+    ctx.ellipse(w*0.52, h*0.89, w*0.42, h*0.10, 0, 0, Math.PI*2);
+    ctx.fill();
+
+    ctx.restore();
+  }
+
+  function drawTopStar(w,h){
+    const x = TREE.cx*w;
+    const y = (TREE.top*h) - 18;
+    ctx.save();
+    ctx.fillStyle = "rgba(250,204,21,0.95)";
+    drawStar(x, y, 14, performance.now()*0.0012);
+    ctx.fillStyle = "rgba(250,204,21,0.18)";
+    ctx.beginPath();
+    ctx.arc(x,y, 34, 0, Math.PI*2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // ===== Main loop =====
+  let lastT = performance.now();
+  function loop(t){
+    const dt = Math.min(0.033, (t-lastT)/1000);
+    lastT = t;
+    step(dt);
+    draw();
+    requestAnimationFrame(loop);
+  }
+
+  // ===== MediaPipe Hands setup =====
+  let hands, camera;
+
+  function dist(a,b){
+    const dx = a.x - b.x, dy = a.y - b.y;
+    return Math.sqrt(dx*dx + dy*dy);
+  }
+
+  function setupHands(){
+    hands = new Hands({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+    });
+    hands.setOptions({
+      maxNumHands: 1,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.6,
+      minTrackingConfidence: 0.6
+    });
+
+    hands.onResults((res) => {
+      if (!res.multiHandLandmarks || res.multiHandLandmarks.length === 0){
+        haveHand = false;
+        handEl.textContent = "未检测";
+        pinchEl.textContent = "—";
+        return;
+      }
+
+      haveHand = true;
+      handEl.textContent = "已检测";
+
+      const lm = res.multiHandLandmarks[0];
+
+      // 指尖：8（食指指尖），捏合：4（拇指指尖）和 8（食指指尖）
+      const indexTip = lm[8];
+      const thumbTip = lm[4];
+
+      // MediaPipe 是以视频为基准的坐标（0..1）。我们镜像显示视频，因此手的 x 也镜像一下更符合直觉。
+      const hx = 1 - indexTip.x;
+      const hy = indexTip.y;
+
+      // 平滑一点
+      handX = handX*0.75 + hx*0.25;
+      handY = handY*0.75 + hy*0.25;
+
+      // pinch 距离：越小越“捏合”
+      const d = dist(indexTip, thumbTip); // 通常 0.02~0.25 之间
+      // 映射到 0..1：d小 => 1；d大 => 0
+      const p = 1 - clamp((d - 0.03) / 0.18, 0, 1);
+      pinchStrength = pinchStrength*0.7 + p*0.3;
+
+      pinchEl.textContent = pinchStrength.toFixed(2);
+    });
+  }
+
+  async function startCamera(){
+    setupHands();
+
+    // 用 CameraUtils 驱动：会自动把 video 帧送入 hands
+    camera = new Camera(video, {
+      onFrame: async () => {
+        await hands.send({image: video});
+      },
+      width: 960,
+      height: 600
+    });
+    await camera.start();
+  }
+
+  startBtn.onclick = async () => {
+    try{
+      startBtn.disabled = true;
+      startBtn.textContent = "启动中…";
+      await startCamera();
+      startBtn.textContent = "摄像头已开启 ✅";
+    }catch(e){
+      console.error(e);
+      startBtn.disabled = false;
+      startBtn.textContent = "开启摄像头";
+      alert("摄像头启动失败：请确认在 HTTPS 页面打开，并允许摄像头权限。");
+    }
+  };
+
+  // ===== Init =====
+  initStars();
+  resetControl();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
